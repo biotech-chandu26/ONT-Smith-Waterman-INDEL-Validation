@@ -1,0 +1,12 @@
+*.bam
+*.bai
+*.sam
+*.fastq
+*.fastq.gz
+*.fa
+*.fasta
+*.water
+*.core
+reports/
+reads/
+alignments/
