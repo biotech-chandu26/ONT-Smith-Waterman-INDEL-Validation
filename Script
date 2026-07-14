@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+#############################################
+# Smith-Waterman pipeline for ONT reads
+#############################################
+
+########### USER SETTINGS ###################
+
+GENOME="reference_region_faecium.fa"
+BAM="SRR32250973_filtered.sorted.bam"
+
+# Put the correct FASTQ here
+FASTQ="SRR32250973_filtered.fastq"
+
+CHR="CP038996.1"
+START=1331
+END=1699
+
+THREADS=8
+
+#############################################
+
+echo "==========================================="
+echo " Smith-Waterman Alignment Pipeline"
+echo "==========================================="
+
+############ Dependency check ################
+
+for tool in samtools seqkit water awk grep sort sed
+do
+    command -v $tool >/dev/null 2>&1 || {
+        echo "ERROR: $tool is not installed."
+        exit 1
+    }
+done
+
+############ File check ######################
+
+for f in "$GENOME" "$BAM" "$FASTQ"
+do
+    if [ ! -f "$f" ]; then
+        echo
+        echo "ERROR: Cannot find $f"
+        exit 1
+    fi
+done
+
+############ Genome index ####################
+
+if [ ! -f "${GENOME}.fai" ]; then
+    echo "Indexing genome..."
+    samtools faidx "$GENOME"
+fi
+
+############ Output folders ##################
+
+mkdir -p \
+reference \
+reads \
+alignments \
+reports
+
+############ Reference #######################
+
+echo "Extracting reference..."
+
+samtools faidx \
+"$GENOME" \
+${CHR}:${START}-${END} \
+> reference/reference.fa
+
+############ Region ##########################
+
+echo "Extracting mapped reads..."
+
+samtools view \
+"$BAM" \
+${CHR}:${START}-${END} \
+> reports/region.sam
+
+cut -f1 reports/region.sam \
+| sort -u \
+> reports/read_ids.txt
+
+TOTAL=$(wc -l < reports/read_ids.txt)
+
+echo
+echo "Reads found: $TOTAL"
+echo
+
+############ Summary #########################
+
+echo -e "ReadID\tIdentity\tSimilarity\tGaps\tScore\tMAPQ\tReferenceStart\tFLAG\tReadLength\tCIGAR\tSNPs\tInsertionEvents\tInsertedBases\tDeletionEvents\tDeletedBases" \
+> reports/alignment_summary.tsv
+
+touch reports/failed_reads.txt
+
+COUNT=1
+
+while read READ
+do
+
+echo "[$COUNT/$TOTAL] $READ"
+
+############ Extract read ####################
+
+seqkit grep \
+-n \
+-p "^${READ}$" \
+"$FASTQ" \
+| seqkit fq2fa \
+> reads/${READ}.fa
+
+if [ ! -s reads/${READ}.fa ]
+then
+    echo "$READ : NOT FOUND" \
+    >> reports/failed_reads.txt
+
+    COUNT=$((COUNT+1))
+    continue
+fi
+
+############ Water ###########################
+
+water \
+-auto \
+-asequence reference/reference.fa \
+-bsequence reads/${READ}.fa \
+-gapopen 10 \
+-gapextend 0.5 \
+-outfile alignments/${READ}.water \
+>/dev/null 2>&1
+
+if [ ! -f alignments/${READ}.water ]
+then
+    echo "$READ : WATER FAILED" \
+    >> reports/failed_reads.txt
+
+    COUNT=$((COUNT+1))
+    continue
+fi
+
+############ Parse ###########################
+
+IDENTITY=$(grep "^# Identity" alignments/${READ}.water | awk '{print $3}')
+SIMILARITY=$(grep "^# Similarity" alignments/${READ}.water | awk '{print $3}')
+GAPS=$(grep "^# Gaps" alignments/${READ}.water | awk '{print $3}')
+SCORE=$(grep "^# Score" alignments/${READ}.water | awk '{print $3}')
+READLEN=$(awk 'NR==2{print length($0)}' reads/${READ}.fa)
+############ Get CIGAR #####################
+
+MAPQ=$(awk -v r="$READ" '$1==r{print $5; exit}' reports/region.sam)
+
+POS=$(awk -v r="$READ" '$1==r{print $4; exit}' reports/region.sam)
+
+FLAG=$(awk -v r="$READ" '$1==r{print $2; exit}' reports/region.sam)
+
+CIGAR=$(awk -v r="$READ" '$1==r{print $6; exit}' reports/region.sam)
+############ Extract MD tag ################
+
+MD=$(awk -v r="$READ" '
+$1==r{
+    for(i=12;i<=NF;i++)
+        if($i~/^MD:Z:/){
+            sub("MD:Z:","",$i)
+            print $i
+            exit
+        }
+}' reports/region.sam)
+
+############ Count SNPs ####################
+
+if [ -z "${MD:-}" ]; then
+    SNPS=0
+else
+    SNPS=$(echo "$MD" | awk '
+    {
+        gsub(/[0-9]/,"")
+        gsub(/\^[A-Z]+/,"")
+        print length($0)
+    }')
+fi
+############ Count insertion events ########
+
+INSERTION_EVENTS=$(echo "$CIGAR" | grep -oE '[0-9]+I' 2>/dev/null | wc -l || true)
+
+############ Count inserted bases ##########
+
+INSERTION_BASES=$(echo "$CIGAR" |
+grep -oE '[0-9]+I' 2>/dev/null |
+sed 's/I//' |
+awk '{s+=$1} END{print s+0}' || echo 0)
+
+############ Count deletion events #########
+
+DELETION_EVENTS=$(echo "$CIGAR" | grep -oE '[0-9]+D' 2>/dev/null | wc -l || true)
+
+############ Count deleted bases ###########
+
+DELETION_BASES=$(echo "$CIGAR" |
+grep -oE '[0-9]+D' 2>/dev/null |
+sed 's/D//' |
+awk '{s+=$1} END{print s+0}' || echo 0)
+
+echo -e \
+"${READ}\t${IDENTITY}\t${SIMILARITY}\t${GAPS}\t${SCORE}\t${MAPQ}\t${POS}\t${FLAG}\t${READLEN}\t${CIGAR}\t${SNPS}\t${INSERTION_EVENTS}\t${INSERTION_BASES}\t${DELETION_EVENTS}\t${DELETION_BASES}" \
+>> reports/alignment_summary.tsv
+
+COUNT=$((COUNT+1))
+
+done < reports/read_ids.txt
+
+############ Sort ############################
+
+{
+head -1 reports/alignment_summary.tsv
+tail -n +2 reports/alignment_summary.tsv | sort -k2 -Vr
+} > reports/alignment_summary_sorted.tsv
+
+echo
+echo "==========================================="
+echo "Pipeline Finished"
+echo "==========================================="
+echo
+
+echo "Results"
+
+echo "reports/alignment_summary.tsv"
+echo "reports/alignment_summary_sorted.tsv"
+echo "reports/failed_reads.txt"
+echo "alignments/"
